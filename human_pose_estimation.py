@@ -16,6 +16,7 @@
 """
 
 import logging
+import time
 import imutils
 import os.path as osp
 import sys
@@ -23,10 +24,12 @@ from argparse import ArgumentParser, SUPPRESS
 from itertools import cycle
 from enum import Enum
 from time import perf_counter
+import dlib
 
 import cv2
 import numpy as np
 from openvino.inference_engine import IECore
+import pyrealsense2 as rs
 
 from human_pose_estimation_demo.model import HPEAssociativeEmbedding, HPEOpenPose
 from human_pose_estimation_demo.visualization import show_poses
@@ -34,6 +37,7 @@ from human_pose_estimation_demo.visualization import show_poses
 sys.path.append(osp.join(osp.dirname(osp.abspath(__file__)), 'common'))
 import monitors
 from helpers import put_highlighted_text
+from scipy.spatial import distance
 
 
 logging.basicConfig(format='[ %(levelname)s ] %(message)s', level=logging.INFO, stream=sys.stdout)
@@ -82,6 +86,74 @@ def build_argparser():
                       help='Optional. List of monitors to show initially.')
     return parser
 
+def find_rec(points):
+    xmin = 9999999
+    xmax = 0
+    ymin = 9999999
+    ymax = 0
+    
+    for p in points:
+        if xmin > p[0]:
+            xmin = p[0]
+        elif xmax < p[0]:
+            xmax = p[0]
+        
+        if ymin > p[1]:
+            ymin = p[1]
+        elif ymax < p[1]:
+            ymax = p[1]
+        
+    assert(xmin < xmax)
+    assert(ymin < ymax)
+    
+    return (int(xmin), int(ymin), int(xmax), int(ymax))
+        
+
+def detect_cough(poses, scores, pose_score_threshold=0.5, point_score_threshold=0.5):
+    default_skeleton = ((15, 13), (13, 11), (16, 14), (14, 12), (11, 12), (5, 11), (6, 12), (5, 6),
+    (5, 7), (6, 8), (7, 9), (8, 10), (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6))
+    criticalPt = [3, 4, 9, 10, 7, 8, 5, 6, 15, 16]
+    
+    if poses.size == 0:
+        return -1, ()
+    skeleton = default_skeleton
+
+    # Loop over the detected people
+    for j, (pose, pose_score) in enumerate(zip(poses, scores)):
+        if pose_score <= pose_score_threshold:
+            continue
+        points = pose[:, :2].astype(int).tolist()
+        points_scores = pose[:, 2]
+        
+        # Check if the target person view is proper to detect the cough
+        skip = False
+        for i, (p, v) in enumerate(zip(points, points_scores)):
+            if (v < point_score_threshold) and (i in criticalPt):
+                skip = True
+        if skip: continue
+        
+        right_arm = distance.euclidean(points[8], points[10])
+        left_arm = distance.euclidean(points[7], points[9])
+        shoulder = distance.euclidean(points[5], points[6])
+        right_arm_ear = distance.euclidean(points[4], points[10])
+        left_arm_ear = distance.euclidean(points[3], points[9])
+
+        # Detect cough
+        detect = True
+        detect = detect and ((shoulder * 1/2) > right_arm_ear or (shoulder * 1/2) > left_arm_ear)
+        detect = detect and ((right_arm > right_arm_ear) or (left_arm > left_arm_ear))
+  
+        if detect:
+            # Return with floor spot on which the person is standing
+            leg = distance.euclidean(points[13], points[15]) * 1/2
+            foot_interval = distance.euclidean(points[15], points[16]) * 1/2
+            left_bottom1 = (points[15][0] + foot_interval, points[15][1] + leg)
+            left_bottom2 = (points[15][0] - foot_interval, points[15][1] - leg)
+            right_bottom1 = (points[16][0] + foot_interval, points[16][1] + leg)
+            right_bottom2 = (points[16][0] - foot_interval, points[16][1] + leg)
+            return j, find_rec([points[15], points[16], left_bottom1, right_bottom1, left_bottom2, right_bottom2])
+    
+    return -1, ()
 
 class Modes(Enum):
     USER_SPECIFIED = 0
@@ -126,15 +198,70 @@ def get_plugin_configs(device, num_streams, num_threads):
 
     return config_user_specified, config_min_latency
 
-
+def move_car(pipeline, captured, rect):
+    arrived = False
+    
+    # Create floor point tracker
+    rgb = cv2.cvtColor(captured, cv2.COLOR_BGR2RGB)
+    tracker = dlib.correlation_tracker()
+    rect = dlib.rectangle(rect[0], rect[1], rect[2], rect[3])
+    tracker.start_track(rgb, rect)
+    
+    while not arrived:
+        frame = pipeline.wait_for_frames()
+        depth = frame.get_depth_frame()
+        frame = np.asanyarray(frame.get_color_frame().get_data())
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        
+        # Update the tracker
+        tracker.update(rgb)
+        pos = tracker.get_position()
+        # unpack the position object
+        startX = int(pos.left())
+        startY = int(pos.top())
+        endX = int(pos.right())
+        endY = int(pos.bottom())
+        
+        put_highlighted_text(frame, "Status: traversing", (15, 20), cv2.FONT_HERSHEY_COMPLEX, 0.75, (200, 10, 10), 2)
+        cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 0, 255), 2)
+        
+        # Centroid pixel of distination
+        centroid = (int((startX + endX) / 2), int((startY + endY) / 2))
+        # Get average distance
+        dis_sum = 0
+        for i in range(10):
+            for j in range(10):
+                w = i - 5
+                h = j - 5
+                try:
+                    dis_sum += depth.get_distance(centroid[0] + w, centroid[1] + h)
+                except:
+                    dis_sum += 0
+        # Remain distance from destination
+        distance_btw_cam_and_object = dis_sum/100
+        
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>> Move car <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        # print(centroid)
+        # print(distance_btw_cam_and_object)
+        
+        
+        # Show frame
+        frame = imutils.resize(frame, width=800)
+        cv2.imshow("Frame", frame)
+        key = cv2.waitKey(1) & 0xFF
+        ESC_KEY = 27
+        if key in {ord('q'), ord('Q'), ESC_KEY}:
+            break
+        
+        
+        
 def main():
     modeSwitched = False
     args = build_argparser().parse_args()
 
     log.info('Initializing Inference Engine...')
     ie = IECore()
-
-    config_user_specified, config_min_latency = get_plugin_configs(args.device, args.num_streams, args.num_threads)
 
     log.info('Loading network...')
     completed_request_results = {}
@@ -152,34 +279,35 @@ def main():
 
     hpes = {
         Modes.USER_SPECIFIED:
-            HPE(ie, args.model, target_size=args.tsize, device=args.device, plugin_config=config_user_specified,
+            HPE(ie, args.model, target_size=args.tsize, device=args.device, plugin_config={},
                 results=completed_request_results, max_num_requests=args.num_infer_requests,
                 caught_exceptions=exceptions),
         Modes.MIN_LATENCY:
             HPE(ie, args.model, target_size=args.tsize, device=args.device.split(':')[-1].split(',')[0],
-                plugin_config=config_min_latency, results=completed_request_results, max_num_requests=1,
+                plugin_config={}, results=completed_request_results, max_num_requests=1,
                 caught_exceptions=exceptions)
     }
+    
+    # grab a reference to the webcam
+    print("[INFO] starting video stream...")
+    pipeline = rs.pipeline()
+    pipeConfig = rs.config()
+    pipeConfig.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    pipeConfig.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    pipeline.start(pipeConfig)
+    time.sleep(2.0)
 
-    try:
-        input_stream = int(args.input)
-    except ValueError:
-        input_stream = args.input
-    cap = cv2.VideoCapture(input_stream)
     wait_key_time = 1
 
     next_frame_id = 0
     next_frame_id_to_show = 0
     input_repeats = 0
-
+    
     log.info('Starting inference...')
     print("To close the application, press 'CTRL+C' here or switch to the output window and press ESC key")
     print("To switch between min_latency/user_specified modes, press TAB key in the output window")
-
-    while (cap.isOpened() \
-           or completed_request_results \
-           or len(hpes[mode].empty_requests) < len(hpes[mode].requests)) \
-          and not exceptions:
+    
+    while not exceptions:
         if next_frame_id_to_show in completed_request_results:
             frame_meta, raw_outputs = completed_request_results.pop(next_frame_id_to_show)
             poses, scores = hpes[mode].postprocess(raw_outputs, frame_meta)
@@ -190,8 +318,12 @@ def main():
             frame = frame_meta['frame']
             start_time = frame_meta['start_time']
 
+            # Detect cough
+            idx, rect = detect_cough(poses, scores)
+            if idx != -1:
+                move_car(pipeline, frame, rect)
+    
             origin_im_size = frame.shape[:-1]
-            # presenter.drawGraphs(frame)
             show_poses(frame, poses, scores, pose_score_threshold=args.prob_threshold,
                 point_score_threshold=args.prob_threshold)
 
@@ -214,7 +346,7 @@ def main():
                 put_highlighted_text(frame, latency_message, (15, 50), cv2.FONT_HERSHEY_COMPLEX, 0.75, (200, 10, 10), 2)
 
             if not args.no_show:
-                frame = imutils.resize(frame, width=1024)
+                frame = imutils.resize(frame, width=800)
                 cv2.imshow("Frame", frame)
                 key = cv2.waitKey(1) & 0xFF
                 #cv2.imwrite('output.png', frame)
@@ -236,16 +368,12 @@ def main():
                     mode_info[mode] = ModeInfo()
                     log.info('Using {} mode'.format(mode.name))
 
-        elif hpes[mode].empty_requests and cap.isOpened():
+        elif hpes[mode].empty_requests:
             start_time = perf_counter()
-            ret, frame = cap.read()
-            if not ret:
-                if input_repeats < args.loop or args.loop < 0:
-                    cap.open(input_stream)
-                    input_repeats += 1
-                else:
-                    cap.release()
-                continue
+            # grab the next frame and handle
+            frame = pipeline.wait_for_frames()
+            depth = frame.get_depth_frame()
+            frame = np.asanyarray(frame.get_color_frame().get_data())
 
             hpes[mode](frame, next_frame_id, {'frame': frame, 'start_time': start_time})
             next_frame_id += 1
@@ -258,17 +386,6 @@ def main():
 
     for exec_net in hpes.values():
         exec_net.await_all()
-
-    for mode_value, mode_stats in mode_info.items():
-        log.info('')
-        log.info('Mode: {}'.format(mode_value.name))
-
-        end_time = mode_stats.last_end_time if mode_stats.last_end_time is not None \
-                                            else perf_counter()
-        log.info('FPS: {:.1f}'.format(mode_stats.frames_count / \
-                                      (end_time - mode_stats.last_start_time)))
-        log.info('Latency: {:.1f} ms'.format((mode_stats.latency_sum / \
-                                             mode_stats.frames_count) * 1e3))
 
 
 if __name__ == '__main__':
