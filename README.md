@@ -1,6 +1,6 @@
 # Human Pose Estimation Python\* Demo
 
-> Folked from [open_model_zoo demos](https://github.com/openvinotoolkit/open_model_zoo/tree/master/demos/python_demos/human_pose_estimation_demo)
+> Forked from [open_model_zoo demos](https://github.com/openvinotoolkit/open_model_zoo/tree/master/demos/python_demos/human_pose_estimation_demo)
 
 This demo showcases the work of multi-person 2D pose estimation algorithms. The task is to predict a pose: body skeleton, which consists of a predefined set of keypoints and connections between them, for every person in an input image/video.
 
