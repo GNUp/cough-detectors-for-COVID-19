@@ -47,8 +47,6 @@ def build_argparser():
     parser = ArgumentParser(add_help=False)
     args = parser.add_argument_group('Options')
     args.add_argument('-h', '--help', action='help', default=SUPPRESS, help='Show this help message and exit.')
-    args.add_argument('-i', '--input', help='Required. Path to an image, video file or a numeric camera ID.',
-                      required=True, type=str)
     args.add_argument('-m', '--model', help='Required. Path to an .xml file with a trained model.',
                       required=True, type=str)
     args.add_argument('-at', '--architecture_type', choices=('ae', 'openpose'), required=True, type=str,
